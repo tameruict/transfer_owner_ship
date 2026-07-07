@@ -683,8 +683,16 @@ def transfer(request: TransferRequest) -> dict:
 @app.post("/api/jobs/block", status_code=202)
 def block(request: BlockRequest) -> dict:
     owner = validate_owner(request.owner_email)
-    cmd = [sys.executable, "-u", str(PROTECT_SCRIPT), "block", "--token", owner.token_path,
-        "--workers", str(request.workers)]
+    # A folder can mix files owned by different accounts, and the block flag can
+    # only be set by each file's owner. Pass every registered account token
+    # (owner first, so it scans) so protect_videos routes each file to its owner.
+    token_paths: list[str] = [owner.token_path]
+    for role in ("A", "B"):
+        for account in accounts.list(role):
+            if account.token_path not in token_paths and Path(account.token_path).is_file():
+                token_paths.append(account.token_path)
+    cmd = [sys.executable, "-u", str(PROTECT_SCRIPT), "block", "--workers", str(request.workers)]
+    for token_path in token_paths: cmd += ["--token", token_path]
     for folder_id in validate_folders(owner, request.folders): cmd += ["--folder-id", folder_id]
     if request.recursive: cmd.append("--recursive")
     if request.all_files: cmd.append("--all-files")

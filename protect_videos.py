@@ -20,12 +20,24 @@ video to account B, account A can no longer block it. So either:
     ownership change and keeps protecting the file under B), or
   * run `block` with account B's token AFTER the transfer.
 
+Mixed owners in one folder
+--------------------------
+A single folder often holds files owned by several accounts. Pass a --token for
+each owner: every file is routed to the token of its actual owner, so one run
+blocks the whole folder no matter who owns each file. Files whose owner has no
+matching token are skipped with a clear message instead of failing on HTTP 403.
+
 Examples
 --------
   # 1) Block download on A's videos in three subject folders (recursive):
   python protect_videos.py block \
       --token token_A.json --recursive \
       --folder-id <TOAN_ID> --folder-id <LY_ID> --folder-id <HOA_ID>
+
+  # 1b) Same folders, files owned by A, B and C mixed together:
+  python protect_videos.py block \
+      --token token_A.json --token token_B.json --token token_C.json \
+      --recursive --folder-id <TOAN_ID> --folder-id <LY_ID> --folder-id <HOA_ID>
 
   # 2) Transfer those same videos from A to B (consumer Gmail, auto-accept):
   python protect_videos.py transfer \
@@ -64,6 +76,7 @@ from transfer_ownership import (
     OAuthTokenError,
     ServiceFactory,
     build_drive_service,
+    describe_item_owners,
     execute_with_retry,
     get_authenticated_email,
     list_folder_children,
@@ -273,11 +286,70 @@ def set_copy_restriction(service, file_id: str, *, restricted: bool) -> bool:
     return bool(info.get("copyRequiresWriterPermission", False))
 
 
+class OwnerRouter:
+    """Pick the right owner token for each file.
+
+    The copy/download restriction can only be set by a file's OWNER. When one
+    folder mixes files from several accounts, a single token hits HTTP 403 on
+    every file it does not own. This router loads one :class:`ServiceFactory`
+    per token, keyed by that token's authenticated Google email, and hands back
+    the factory whose account owns a given file. Each factory keeps its own
+    per-thread Drive service, so routing stays thread-safe under the worker pool.
+    """
+
+    def __init__(self, token_paths: Iterable[str]) -> None:
+        self.factories_by_email: dict[str, ServiceFactory] = {}
+        self.emails: list[str] = []
+        # The first successfully loaded token scans the folders; any token with
+        # shared access to the folder can enumerate children (each child still
+        # reports its real owner), so routing does not depend on which one scans.
+        self.scanner: ServiceFactory | None = None
+        seen_paths: set[str] = set()
+
+        for raw_path in token_paths:
+            path = str(raw_path).strip()
+            if not path or path in seen_paths:
+                continue
+            seen_paths.add(path)
+            factory = ServiceFactory(path)
+            email = get_authenticated_email(factory.primary)
+            key = email.casefold()
+            if not key or key in self.factories_by_email:
+                # Duplicate account (same email behind two token files): keep the
+                # first, ignore the rest so we never double-count an owner.
+                continue
+            self.factories_by_email[key] = factory
+            self.emails.append(email)
+            if self.scanner is None:
+                self.scanner = factory
+
+        if self.scanner is None:
+            raise OAuthTokenError(
+                next(iter(token_paths), "token.json"),
+                "No usable owner tokens were provided for block.",
+            )
+
+    def factory_for(self, item: DriveItem) -> ServiceFactory | None:
+        """Return the token factory that owns ``item``, or None if unmatched.
+
+        Falls back to the single loaded token when Drive returns no owner
+        metadata AND only one account was supplied — the classic one-owner case.
+        """
+        for email in item.owner_emails:
+            factory = self.factories_by_email.get(email.casefold())
+            if factory is not None:
+                return factory
+        if not item.owner_emails and len(self.factories_by_email) == 1:
+            return self.scanner
+        return None
+
+
 def run_block(args: argparse.Namespace) -> int:
     workers = max(1, min(getattr(args, "workers", 4), 16))
     all_files = getattr(args, "all_files", False)
+    token_paths = args.token or ["token.json"]
     try:
-        factory = ServiceFactory(args.token)
+        router = OwnerRouter(token_paths)
     except OAuthTokenError as exc:
         print(f"[AUTH ERR] {exc}", file=sys.stderr)
         return 2
@@ -285,7 +357,7 @@ def run_block(args: argparse.Namespace) -> int:
     action = "BLOCK" if restricted else "UNBLOCK"
 
     targets = collect_videos(
-        factory.primary,
+        router.scanner.primary,
         args.folder_id,
         recursive=args.recursive,
         accept=is_blockable_file if all_files else is_video,
@@ -296,11 +368,19 @@ def run_block(args: argparse.Namespace) -> int:
     print(
         f"Found {len(targets)} {kind}(s) across {len(args.folder_id)} folder(s). "
         f"action={action} all_files={all_files} workers={workers} "
+        f"owners={len(router.factories_by_email)} tokens=[{', '.join(router.emails)}] "
         f"dry_run={args.dry_run}"
     )
 
     def process_one(item: DriveItem) -> ItemOutcome:
         label = f"{item.name} ({item.id})"
+        factory = router.factory_for(item)
+        if factory is None:
+            return ItemOutcome(
+                "skip",
+                f"[SKIP] {action} {label}: no owner token loaded for "
+                f"{describe_item_owners(item)} — add that account's token",
+            )
         if args.dry_run:
             return ItemOutcome("ok", f"[DRY]  {action} {label}")
         service = factory.get()
@@ -430,8 +510,14 @@ def parse_args() -> argparse.Namespace:
     _add_common_scan_args(b)
     b.add_argument(
         "--token",
-        default="token.json",
-        help="OAuth token JSON for the account that OWNS the videos (default: token.json).",
+        action="append",
+        metavar="TOKEN_JSON",
+        help=(
+            "OAuth token JSON for an account that OWNS some of the videos. "
+            "Repeat --token for every owner whose files live in the folder; "
+            "each file is routed to the matching owner's token automatically "
+            "(default: token.json when none given)."
+        ),
     )
     b.add_argument(
         "--all-files",
