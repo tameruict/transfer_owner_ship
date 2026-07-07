@@ -222,8 +222,17 @@ def run_block(payload, paths):
     folders = payload.get("folders", [])
     if not folders:
         raise SystemExit("Payload block không có folder nào.")
-    cmd = [sys.executable, "-u", "protect_videos.py", "block", "--token", owner_token,
+    # A folder can mix files owned by different accounts, and the block flag can
+    # only be set by each file's owner. Pass every materialized account token
+    # (owner first, so it scans) so protect_videos routes each file to its owner.
+    token_paths = [owner_token]
+    for path in paths.values():
+        if path not in token_paths:
+            token_paths.append(path)
+    cmd = [sys.executable, "-u", "protect_videos.py", "block",
            "--workers", str(_workers(payload))]
+    for path in token_paths:
+        cmd += ["--token", path]
     for fid in folders:
         cmd += ["--folder-id", fid]
     if payload.get("recursive"):
