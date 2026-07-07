@@ -110,8 +110,9 @@ def is_video(item: DriveItem) -> bool:
 def is_blockable_file(item: DriveItem) -> bool:
     """True for any real, downloadable file (not a folder or shortcut).
 
-    Used by ``block --all-files`` so PDFs, slides and other course material get
-    the same download/copy/print restriction as the videos.
+    Used by the transfer flow's "files" scope so PDFs, slides and other course
+    material move ownership alongside the videos. The block flow deliberately
+    does NOT use this — it only restricts videos (see :func:`is_video`).
     """
     return item.mime_type not in (FOLDER_MIME_TYPE, SHORTCUT_MIME_TYPE)
 
@@ -346,7 +347,6 @@ class OwnerRouter:
 
 def run_block(args: argparse.Namespace) -> int:
     workers = max(1, min(getattr(args, "workers", 4), 16))
-    all_files = getattr(args, "all_files", False)
     token_paths = args.token or ["token.json"]
     try:
         router = OwnerRouter(token_paths)
@@ -356,18 +356,19 @@ def run_block(args: argparse.Namespace) -> int:
     restricted = not args.unblock
     action = "BLOCK" if restricted else "UNBLOCK"
 
+    # Block only ever targets video files (video/*). PDFs, slides, MP3s and other
+    # course material are intentionally left downloadable.
     targets = collect_videos(
         router.scanner.primary,
         args.folder_id,
         recursive=args.recursive,
-        accept=is_blockable_file if all_files else is_video,
+        accept=is_video,
     )
     if args.max_items is not None:
         targets = targets[: args.max_items]
-    kind = "file" if all_files else "video"
     print(
-        f"Found {len(targets)} {kind}(s) across {len(args.folder_id)} folder(s). "
-        f"action={action} all_files={all_files} workers={workers} "
+        f"Found {len(targets)} video(s) across {len(args.folder_id)} folder(s). "
+        f"action={action} workers={workers} "
         f"owners={len(router.factories_by_email)} tokens=[{', '.join(router.emails)}] "
         f"dry_run={args.dry_run}"
     )
@@ -518,11 +519,6 @@ def parse_args() -> argparse.Namespace:
             "each file is routed to the matching owner's token automatically "
             "(default: token.json when none given)."
         ),
-    )
-    b.add_argument(
-        "--all-files",
-        action="store_true",
-        help="Block every file type (PDF, slides…), not just videos.",
     )
     b.add_argument(
         "--unblock",

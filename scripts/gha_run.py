@@ -237,8 +237,6 @@ def run_block(payload, paths):
         cmd += ["--folder-id", fid]
     if payload.get("recursive"):
         cmd += ["--recursive"]
-    if payload.get("all_files"):
-        cmd += ["--all-files"]
     if payload.get("unblock"):
         cmd += ["--unblock"]
     if payload.get("dry_run"):

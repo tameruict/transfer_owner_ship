@@ -649,7 +649,6 @@ function buildBlockPayload(body) {
     unblock: Boolean(body.unblock),
     dry_run: Boolean(body.dry_run),
     workers: clampWorkers(body.workers),
-    all_files: Boolean(body.all_files),
   }
 }
 
@@ -874,13 +873,12 @@ async function handleBlock(body) {
   const drive = driveFromToken(owner.token)
   const folderIds = (body.folders || []).map(extractFolderId)
   if (!folderIds.length) throw Object.assign(new Error('Cần ít nhất một folder'), { status: 422 })
-  const allFiles = Boolean(body.all_files)
   const workers = clampWorkers(body.workers)
-  const targets = await collectVideos(drive, folderIds, body.recursive !== false, logs, allFiles ? isBlockableFile : isVideo)
+  // Block only ever targets videos (video/*); PDFs, MP3s and slides stay downloadable.
+  const targets = await collectVideos(drive, folderIds, body.recursive !== false, logs, isVideo)
   const restricted = !body.unblock
   const action = restricted ? 'BLOCK' : 'UNBLOCK'
-  const kind = allFiles ? 'file' : 'video'
-  logs.push(`Found ${targets.length} ${kind}(s) across ${folderIds.length} folder(s). action=${action} all_files=${allFiles} workers=${workers} dry_run=${Boolean(body.dry_run)}`)
+  logs.push(`Found ${targets.length} video(s) across ${folderIds.length} folder(s). action=${action} workers=${workers} dry_run=${Boolean(body.dry_run)}`)
   let success = 0
   let failed = 0
   await runPool(targets, body.dry_run ? 1 : workers, async (item) => {

@@ -226,7 +226,6 @@ class BlockRequest(BaseModel):
     unblock: bool = False
     dry_run: bool = False
     workers: int = Field(default=4, ge=1, le=16)
-    all_files: bool = False
 
 
 def inspect_token(path: Path) -> Account:
@@ -695,7 +694,6 @@ def block(request: BlockRequest) -> dict:
     for token_path in token_paths: cmd += ["--token", token_path]
     for folder_id in validate_folders(owner, request.folders): cmd += ["--folder-id", folder_id]
     if request.recursive: cmd.append("--recursive")
-    if request.all_files: cmd.append("--all-files")
     if request.unblock: cmd.append("--unblock")
     if request.dry_run: cmd.append("--dry-run")
     job = start_job("block", [cmd])
