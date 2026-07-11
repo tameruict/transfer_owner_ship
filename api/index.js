@@ -574,8 +574,15 @@ async function transferConsumer(ownerDrive, acceptDrive, item, email, notify) {
 async function setCopyRestriction(drive, fileId, restricted) {
   await drive.files.update({
     fileId,
-    requestBody: { copyRequiresWriterPermission: restricted },
-    fields: 'id,copyRequiresWriterPermission',
+    requestBody: {
+      downloadRestrictions: {
+        itemDownloadRestriction: {
+          restrictedForReaders: restricted,
+          restrictedForWriters: restricted,
+        },
+      },
+    },
+    fields: 'id,copyRequiresWriterPermission,downloadRestrictions',
     supportsAllDrives: true,
   })
 }

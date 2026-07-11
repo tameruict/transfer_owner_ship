@@ -7,14 +7,13 @@ Two operations on the VIDEO files found inside one or more Drive folders
             Reuses the consumer (pending-owner) or workspace (direct) flow
             from transfer_ownership.py.
 
-  block     Set Google Drive's "copyRequiresWriterPermission" flag on every
-            video. This disables Download / Copy / Print for anyone who only
-            has viewer or commenter access — the people who would crawl and
-            re-sell your material. Editors/owners are unaffected.
+  block     Set Google Drive's download restriction on every
+            video. This disables Download / Copy / Print for non-owners
+            (readers, commenters and writers). Owners are unaffected.
 
 IMPORTANT ordering note
 -----------------------
-The block flag can only be set by the file's OWNER. Once account A transfers a
+The download restriction can only be set by the file's OWNER. Once account A transfers a
 video to account B, account A can no longer block it. So either:
   * run `block` with account A BEFORE transferring (the flag survives the
     ownership change and keeps protecting the file under B), or
@@ -263,28 +262,61 @@ def run_transfer(args: argparse.Namespace) -> int:
 # --------------------------------------------------------------------------- #
 
 
+def _download_restriction_payload(restricted: bool) -> dict:
+    return {
+        "downloadRestrictions": {
+            "itemDownloadRestriction": {
+                "restrictedForReaders": restricted,
+                "restrictedForWriters": restricted,
+            }
+        }
+    }
+
+
+def _download_restrictions_are_applied(info: dict) -> bool:
+    restrictions = info.get("downloadRestrictions") or {}
+    effective = restrictions.get("effectiveDownloadRestrictionWithContext") or {}
+    item = restrictions.get("itemDownloadRestriction") or {}
+
+    reader_restricted = bool(
+        effective.get("restrictedForReaders", item.get("restrictedForReaders", False))
+    )
+    writer_restricted = bool(
+        effective.get("restrictedForWriters", item.get("restrictedForWriters", False))
+    )
+    return reader_restricted and writer_restricted
+
+
 def get_copy_restriction(service, file_id: str) -> bool:
     info = execute_with_retry(
         service.files().get(
             fileId=file_id,
-            fields="copyRequiresWriterPermission",
+            fields=(
+                "copyRequiresWriterPermission,"
+                "downloadRestrictions(itemDownloadRestriction,"
+                "effectiveDownloadRestrictionWithContext)"
+            ),
             supportsAllDrives=True,
         )
     )
-    return bool(info.get("copyRequiresWriterPermission", False))
+    return _download_restrictions_are_applied(info)
 
 
 def set_copy_restriction(service, file_id: str, *, restricted: bool) -> bool:
-    """Set the flag and return the value Drive actually stored (for verify)."""
+    """Set Drive's download restriction and return the stored value for verify."""
     info = execute_with_retry(
         service.files().update(
             fileId=file_id,
-            body={"copyRequiresWriterPermission": restricted},
-            fields="id,copyRequiresWriterPermission",
+            body=_download_restriction_payload(restricted),
+            fields=(
+                "id,copyRequiresWriterPermission,"
+                "downloadRestrictions(itemDownloadRestriction,"
+                "effectiveDownloadRestrictionWithContext)"
+            ),
             supportsAllDrives=True,
         )
     )
-    return bool(info.get("copyRequiresWriterPermission", False))
+    return _download_restrictions_are_applied(info)
 
 
 class OwnerRouter:
@@ -301,21 +333,37 @@ class OwnerRouter:
     def __init__(self, token_paths: Iterable[str]) -> None:
         self.factories_by_email: dict[str, ServiceFactory] = {}
         self.emails: list[str] = []
+        self.skipped_token_errors: list[str] = []
         # The first successfully loaded token scans the folders; any token with
         # shared access to the folder can enumerate children (each child still
         # reports its real owner), so routing does not depend on which one scans.
         self.scanner: ServiceFactory | None = None
         seen_paths: set[str] = set()
+        token_path_list = [str(raw_path).strip() for raw_path in token_paths]
 
-        for raw_path in token_paths:
-            path = str(raw_path).strip()
+        for path in token_path_list:
             if not path or path in seen_paths:
                 continue
             seen_paths.add(path)
-            factory = ServiceFactory(path)
-            email = get_authenticated_email(factory.primary)
+            try:
+                factory = ServiceFactory(path)
+                email = get_authenticated_email(factory.primary)
+            except OAuthTokenError as exc:
+                self._skip_unusable_token(str(exc))
+                continue
+            except HttpError as exc:
+                self._skip_unusable_token(
+                    f"Could not verify OAuth token account: {exc}{_error_hint(exc)} "
+                    f"Token: {path}"
+                )
+                continue
             key = email.casefold()
-            if not key or key in self.factories_by_email:
+            if not key:
+                self._skip_unusable_token(
+                    f"Drive did not return an account email for this token. Token: {path}"
+                )
+                continue
+            if key in self.factories_by_email:
                 # Duplicate account (same email behind two token files): keep the
                 # first, ignore the rest so we never double-count an owner.
                 continue
@@ -326,9 +374,13 @@ class OwnerRouter:
 
         if self.scanner is None:
             raise OAuthTokenError(
-                next(iter(token_paths), "token.json"),
+                next((path for path in token_path_list if path), "token.json"),
                 "No usable owner tokens were provided for block.",
             )
+
+    def _skip_unusable_token(self, reason: str) -> None:
+        self.skipped_token_errors.append(reason)
+        print(f"[WARN] Skipping unusable block token: {reason}", file=sys.stderr)
 
     def factory_for(self, item: DriveItem) -> ServiceFactory | None:
         """Return the token factory that owns ``item``, or None if unmatched.
@@ -358,18 +410,23 @@ def run_block(args: argparse.Namespace) -> int:
 
     # Block only ever targets video files (video/*). PDFs, slides, MP3s and other
     # course material are intentionally left downloadable.
-    targets = collect_videos(
-        router.scanner.primary,
-        args.folder_id,
-        recursive=args.recursive,
-        accept=is_video,
-    )
+    try:
+        targets = collect_videos(
+            router.scanner.primary,
+            args.folder_id,
+            recursive=args.recursive,
+            accept=is_video,
+        )
+    except HttpError as exc:
+        print(f"[ERR]  scan folders: {exc}{_error_hint(exc)}", file=sys.stderr)
+        return 1
     if args.max_items is not None:
         targets = targets[: args.max_items]
     print(
         f"Found {len(targets)} video(s) across {len(args.folder_id)} folder(s). "
         f"action={action} workers={workers} "
         f"owners={len(router.factories_by_email)} tokens=[{', '.join(router.emails)}] "
+        f"skipped_tokens={len(router.skipped_token_errors)} "
         f"dry_run={args.dry_run}"
     )
 
@@ -380,7 +437,7 @@ def run_block(args: argparse.Namespace) -> int:
             return ItemOutcome(
                 "skip",
                 f"[SKIP] {action} {label}: no owner token loaded for "
-                f"{describe_item_owners(item)} — add that account's token",
+                f"{describe_item_owners(item)} — add or re-login that account's token",
             )
         if args.dry_run:
             return ItemOutcome("ok", f"[DRY]  {action} {label}")
