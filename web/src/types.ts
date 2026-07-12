@@ -1,5 +1,5 @@
 export type Role = 'A' | 'B'
-export type View = 'transfer' | 'block' | 'accounts' | 'history'
+export type View = 'transfer' | 'copy-drive' | 'block' | 'accounts' | 'history'
 
 export interface Account {
   role: Role

@@ -43,6 +43,7 @@ A_REGISTRY, A_TOKEN_DIR = ROOT / "account_a_accounts.json", ROOT / "account_a_to
 B_REGISTRY, B_TOKEN_DIR = ROOT / "account_b_accounts.json", ROOT / "account_b_tokens"
 LEGACY_A_TOKEN = ROOT / "token.json"
 TRANSFER_SCRIPT, PROTECT_SCRIPT = ROOT / "auto_transfer_videos.py", ROOT / "protect_videos.py"
+COPY_DRIVE_SCRIPT = ROOT / "copy_drive.py"
 SESSION_COOKIE = "owner_tool_session"
 SESSION_TTL_SECONDS = 60 * 60 * 12
 
@@ -226,6 +227,21 @@ class BlockRequest(BaseModel):
     unblock: bool = False
     dry_run: bool = False
     workers: int = Field(default=4, ge=1, le=16)
+
+
+class CopyDriveRequest(BaseModel):
+    owner_email: str
+    dest: str
+    sources: list[str] = Field(min_length=1)
+    recursive: bool = True
+    checkpoint: bool = True
+    dry_run: bool = False
+    workers: int = Field(default=10, ge=1, le=16)
+    exclude: str = ""
+    sort: Literal["name", "stt"] = "name"
+    filter_mode: Literal["all", "files", "videos", "custom"] = "all"
+    file_extensions: list[str] = Field(default_factory=list)
+    video_extensions: list[str] = Field(default_factory=list)
 
 
 def inspect_token(path: Path) -> Account:
@@ -697,6 +713,58 @@ def block(request: BlockRequest) -> dict:
     if request.unblock: cmd.append("--unblock")
     if request.dry_run: cmd.append("--dry-run")
     job = start_job("block", [cmd])
+    return {"job_id": job.id, "id": job.id, "type": job.kind, "status": job.status}
+
+
+@app.post("/api/jobs/copy-drive", status_code=202)
+def copy_drive(request: CopyDriveRequest) -> dict:
+    owner = validate_owner(request.owner_email)
+    try:
+        source_ids = list(dict.fromkeys(extract_folder_id(value) for value in request.sources))
+        dest_id = extract_folder_id(request.dest)
+    except ValueError as exc:
+        raise HTTPException(422, str(exc)) from exc
+    if not source_ids:
+        raise HTTPException(422, "Cần ít nhất một link/id nguồn")
+    try:
+        service = build_drive_service(owner.token_path)
+        if get_file(service, dest_id).mime_type != FOLDER_MIME_TYPE:
+            raise HTTPException(422, f"Drive đích không phải folder: {dest_id}")
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(400, "Không truy cập được folder đích bằng account A đã chọn") from exc
+
+    cmd = [
+        sys.executable,
+        "-u",
+        str(COPY_DRIVE_SCRIPT),
+        "--sources",
+        ",".join(source_ids),
+        "--dest",
+        dest_id,
+        "--owner-token",
+        owner.token_path,
+        "--workers",
+        str(request.workers),
+        "--sort",
+        request.sort,
+        "--filter-mode",
+        request.filter_mode,
+        "--file-extensions",
+        ",".join(request.file_extensions),
+        "--video-extensions",
+        ",".join(request.video_extensions),
+        "--exclude",
+        request.exclude,
+    ]
+    if not request.recursive:
+        cmd.append("--no-recursive")
+    if not request.checkpoint:
+        cmd.append("--no-checkpoint")
+    if request.dry_run:
+        cmd.append("--dry-run")
+    job = start_job("copy-drive", [cmd])
     return {"job_id": job.id, "id": job.id, "type": job.kind, "status": job.status}
 
 

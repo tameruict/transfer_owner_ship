@@ -248,6 +248,47 @@ def run_block(payload, paths):
     return 1 if code else 0
 
 
+def run_copy_drive(payload, paths):
+    owner_token = token_path(paths, "A", payload["owner_email"])
+    sources = payload.get("sources", [])
+    dest = payload.get("dest", "")
+    if not sources or not dest:
+        raise SystemExit("Payload copy-drive thiếu sources hoặc dest.")
+    cmd = [
+        sys.executable,
+        "-u",
+        "copy_drive.py",
+        "--sources",
+        ",".join(sources),
+        "--dest",
+        dest,
+        "--owner-token",
+        owner_token,
+        "--workers",
+        str(_workers(payload)),
+        "--sort",
+        payload.get("sort", "name"),
+        "--filter-mode",
+        payload.get("filter_mode", "all"),
+        "--file-extensions",
+        ",".join(payload.get("file_extensions", []) or []),
+        "--video-extensions",
+        ",".join(payload.get("video_extensions", []) or []),
+        "--exclude",
+        payload.get("exclude", ""),
+    ]
+    if not payload.get("recursive", True):
+        cmd += ["--no-recursive"]
+    if not payload.get("checkpoint", True):
+        cmd += ["--no-checkpoint"]
+    if payload.get("dry_run"):
+        cmd += ["--dry-run"]
+    log(f"::group::COPY DRIVE {len(sources)} source(s)")
+    code = run(cmd)
+    log("::endgroup::")
+    return 1 if code else 0
+
+
 def main():
     raw_payload = os.environ.get("GHA_JOB_PAYLOAD", "").strip()
     if not raw_payload:
@@ -259,7 +300,12 @@ def main():
     paths = materialize_tokens(bundle)
 
     log(f"Owner Video Tool · GitHub Actions runner · kind={kind} dry_run={bool(payload.get('dry_run'))}")
-    failures = run_transfer(payload, paths) if kind == "transfer" else run_block(payload, paths)
+    if kind == "transfer":
+        failures = run_transfer(payload, paths)
+    elif kind == "copy-drive":
+        failures = run_copy_drive(payload, paths)
+    else:
+        failures = run_block(payload, paths)
 
     if failures:
         log(f"Hoàn tất với {failures} lỗi.")

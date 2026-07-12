@@ -41,6 +41,7 @@ export const api = {
   remove: (role: Role, email: string) => request<{ ok: boolean; active_a?: string | null }>(`/api/accounts/${role}/${encodeURIComponent(email)}`, { method: 'DELETE' }),
   startTransfer: async (body: unknown) => normalizeJob(await request<RawJob>('/api/jobs/transfer', { method: 'POST', body: JSON.stringify(body) })),
   startBlock: async (body: unknown) => normalizeJob(await request<RawJob>('/api/jobs/block', { method: 'POST', body: JSON.stringify(body) })),
+  startCopyDrive: async (body: unknown) => normalizeJob(await request<RawJob>('/api/jobs/copy-drive', { method: 'POST', body: JSON.stringify(body) })),
   job: async (id: string) => normalizeJob(await request<RawJob>(`/api/jobs/${id}`)),
   stop: async (id: string) => normalizeJob(await request<RawJob>(`/api/jobs/${id}/stop`, { method: 'POST' })),
 }

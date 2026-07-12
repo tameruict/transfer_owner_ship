@@ -2,6 +2,7 @@ import { useCallback, useEffect, useMemo, useState } from 'react'
 import { api } from './api'
 import { Accounts } from './components/Accounts'
 import { BlockForm } from './components/BlockForm'
+import { CopyDriveForm } from './components/CopyDriveForm'
 import { History } from './components/History'
 import { JobLog } from './components/JobLog'
 import { LoginScreen } from './components/LoginScreen'
@@ -51,7 +52,7 @@ export default function App() {
     return () => window.clearInterval(timer)
   }, [job?.id, job?.status])
 
-  const startJob = async (kind: 'transfer' | 'block', payload: unknown) => { setLoading(true); setNotice(''); try { const next = kind === 'transfer' ? await api.startTransfer(payload) : await api.startBlock(payload); const normalized = { ...next, type: next.type || kind }; setJob(normalized); setJobs(all => [normalized, ...all.filter(item => item.id !== normalized.id)]); setLogsOpen(true) } catch (error) { setNotice((error as Error).message) } finally { setLoading(false) } }
+  const startJob = async (kind: 'transfer' | 'block' | 'copy-drive', payload: unknown) => { setLoading(true); setNotice(''); try { const next = kind === 'transfer' ? await api.startTransfer(payload) : kind === 'copy-drive' ? await api.startCopyDrive(payload) : await api.startBlock(payload); const normalized = { ...next, type: next.type || kind }; setJob(normalized); setJobs(all => [normalized, ...all.filter(item => item.id !== normalized.id)]); setLogsOpen(true) } catch (error) { setNotice((error as Error).message) } finally { setLoading(false) } }
   const connectAccount = (role: Role) => {
     setNotice('')
     // Redirect-based Google web OAuth. /api/oauth/start 302s to Google; after
@@ -85,6 +86,7 @@ export default function App() {
       <div className="content-area">
         {notice && <div className="notice" role="alert"><span>{notice}</span><button onClick={() => setNotice('')}>×</button></div>}
         {view === 'transfer' && <TransferForm accounts={accounts} ownerEmail={activeA?.email || ''} busy={loading} onSubmit={payload => startJob('transfer', payload)} />}
+        {view === 'copy-drive' && <CopyDriveForm ownerEmail={activeA?.email || ''} busy={loading} onSubmit={payload => startJob('copy-drive', payload)} />}
         {view === 'block' && <BlockForm ownerEmail={activeA?.email || ''} busy={loading} onSubmit={payload => startJob('block', payload)} />}
         {view === 'accounts' && <Accounts accounts={accounts} loading={loading} onConnect={connectAccount} onActivate={activate} onDelete={removeAccount} />}
         {view === 'history' && <History jobs={jobs} onSelect={selected => { setJob(selected); setLogsOpen(true) }} />}

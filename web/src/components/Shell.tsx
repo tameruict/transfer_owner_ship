@@ -1,8 +1,9 @@
-import { Ban, Clock3, FolderKey, LogOut, Menu, Repeat2, UsersRound, X } from 'lucide-react'
+import { Ban, Clock3, Copy, FolderKey, LogOut, Menu, Repeat2, UsersRound, X } from 'lucide-react'
 import type { ReactNode } from 'react'
 import type { Account, View } from '../types'
 
 const items: Array<{ id: View; label: string; icon: typeof Repeat2 }> = [
+  { id: 'copy-drive', label: 'Copy Drive', icon: Copy },
   { id: 'transfer', label: 'Chuyển owner', icon: Repeat2 },
   { id: 'block', label: 'Chặn tải xuống', icon: Ban },
   { id: 'accounts', label: 'Tài khoản', icon: UsersRound },

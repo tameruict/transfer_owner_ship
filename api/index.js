@@ -13,6 +13,8 @@ const ROOT = path.resolve(__dirname, '..')
 const FOLDER_MIME = 'application/vnd.google-apps.folder'
 const SHORTCUT_MIME = 'application/vnd.google-apps.shortcut'
 const VIDEO_PREFIX = 'video/'
+const DEFAULT_FILE_EXTENSIONS = ['.pdf', '.doc', '.docx', '.rtf', '.txt', '.ppt', '.pptx', '.xls', '.xlsx', '.csv', '.mp3', '.wav', '.m4a', '.aac']
+const DEFAULT_VIDEO_EXTENSIONS = ['.mp4', '.mov', '.mkv', '.avi', '.webm', '.m4v', '.wmv', '.flv', '.mpeg', '.mpg']
 const ALLOWED_EMAIL = (process.env.OWNER_TOOL_ALLOWED_EMAIL || 'tamatm6713@gmail.com').trim().toLowerCase()
 const SESSION_COOKIE = 'owner_tool_session'
 const SESSION_TTL_SECONDS = 60 * 60 * 12
@@ -312,7 +314,7 @@ function extractFolderId(value) {
 async function getFile(drive, fileId) {
   const { data } = await drive.files.get({
     fileId,
-    fields: 'id,name,mimeType,owners(emailAddress),ownedByMe,copyRequiresWriterPermission',
+    fields: 'id,name,mimeType,owners(emailAddress),ownedByMe,copyRequiresWriterPermission,capabilities(canCopy)',
     supportsAllDrives: true,
   })
   return {
@@ -321,6 +323,7 @@ async function getFile(drive, fileId) {
     mimeType: data.mimeType || '',
     owners: data.owners || [],
     ownedByMe: typeof data.ownedByMe === 'boolean' ? data.ownedByMe : undefined,
+    canCopy: data.capabilities?.canCopy !== false,
   }
 }
 
@@ -330,7 +333,7 @@ async function listChildren(drive, folderId) {
   do {
     const { data } = await drive.files.list({
       q: `'${folderId.replace(/'/g, "\\'")}' in parents and trashed = false`,
-      fields: 'nextPageToken,files(id,name,mimeType,owners(emailAddress),ownedByMe)',
+      fields: 'nextPageToken,files(id,name,mimeType,owners(emailAddress),ownedByMe,capabilities(canCopy))',
       pageSize: 1000,
       pageToken,
       supportsAllDrives: true,
@@ -345,7 +348,88 @@ async function listChildren(drive, folderId) {
     mimeType: item.mimeType || '',
     owners: item.owners || [],
     ownedByMe: typeof item.ownedByMe === 'boolean' ? item.ownedByMe : undefined,
+    canCopy: item.capabilities?.canCopy !== false,
   }))
+}
+
+function driveQueryText(value) {
+  return String(value || '').replace(/\\/g, '\\\\').replace(/'/g, "\\'")
+}
+
+function normalizeExtensions(items, fallback) {
+  const input = Array.isArray(items) ? items : String(items || '').split(/[\s,;]+/)
+  const out = input
+    .map(item => String(item || '').trim().toLowerCase())
+    .filter(Boolean)
+    .map(item => (item.startsWith('.') ? item : `.${item}`))
+  return out.length ? out : fallback
+}
+
+function copyFilterAccept(item, mode, fileExtensions, videoExtensions) {
+  if (item.mimeType === FOLDER_MIME || item.mimeType === SHORTCUT_MIME) return false
+  if (mode === 'all') return true
+  const name = String(item.name || '').toLowerCase()
+  const isVideoMime = String(item.mimeType || '').startsWith(VIDEO_PREFIX)
+  const isGoogleDoc = String(item.mimeType || '').startsWith('application/vnd.google-apps.')
+  if (mode === 'videos') return isVideoMime || videoExtensions.some(ext => name.endsWith(ext))
+  if (mode === 'files') return !isVideoMime && (isGoogleDoc || fileExtensions.some(ext => name.endsWith(ext)))
+  if (mode === 'custom') return [...fileExtensions, ...videoExtensions].some(ext => name.endsWith(ext))
+  return true
+}
+
+async function findExistingChild(drive, parentId, name, mimeType = '') {
+  let q = `'${driveQueryText(parentId)}' in parents and name='${driveQueryText(name)}' and trashed = false`
+  if (mimeType) q += ` and mimeType='${driveQueryText(mimeType)}'`
+  const { data } = await drive.files.list({
+    q,
+    fields: 'files(id,name)',
+    pageSize: 1,
+    supportsAllDrives: true,
+    includeItemsFromAllDrives: true,
+  })
+  return data.files?.[0]?.id || ''
+}
+
+async function ensureCopyFolder(drive, parentId, name, logs, dryRun) {
+  const existing = await findExistingChild(drive, parentId, name, FOLDER_MIME)
+  if (existing) return existing
+  if (dryRun) {
+    logs.push(`[DRY]  folder ${name}`)
+    return parentId
+  }
+  const { data } = await drive.files.create({
+    requestBody: { name, mimeType: FOLDER_MIME, parents: [parentId] },
+    fields: 'id',
+    supportsAllDrives: true,
+  })
+  logs.push(`[OK]   folder ${name}`)
+  return data.id
+}
+
+async function copyDriveFile(drive, item, destId, copiedIds, logs, dryRun) {
+  if (copiedIds.has(item.id)) {
+    logs.push(`[skip] checkpoint ${item.name}`)
+    return ''
+  }
+  if (dryRun) {
+    logs.push(`[DRY]  copy ${item.name}`)
+    return `dry-file:${item.id}`
+  }
+  const existing = await findExistingChild(drive, destId, item.name)
+  if (existing) {
+    copiedIds.add(item.id)
+    logs.push(`[skip] exists ${item.name}`)
+    return existing
+  }
+  const { data } = await drive.files.copy({
+    fileId: item.id,
+    requestBody: { name: item.name, parents: [destId] },
+    fields: 'id',
+    supportsAllDrives: true,
+  })
+  copiedIds.add(item.id)
+  logs.push(`[OK]   file ${item.name}`)
+  return data.id
 }
 
 function ownerEmails(item) {
@@ -659,6 +743,28 @@ function buildBlockPayload(body) {
   }
 }
 
+function buildCopyDrivePayload(body) {
+  const owner = findAccount('A', body.owner_email)
+  if (!owner) throw Object.assign(new Error('Account A chưa đăng ký'), { status: 400 })
+  const sources = (body.sources || []).map(extractFolderId)
+  const dest = extractFolderId(body.dest || '')
+  if (!sources.length) throw Object.assign(new Error('Cần ít nhất một link/id nguồn'), { status: 422 })
+  return {
+    owner_email: owner.email,
+    sources: [...new Set(sources)],
+    dest,
+    recursive: body.recursive !== false,
+    checkpoint: body.checkpoint !== false,
+    dry_run: Boolean(body.dry_run),
+    workers: clampWorkers(body.workers, 10),
+    exclude: String(body.exclude || ''),
+    sort: body.sort === 'stt' ? 'stt' : 'name',
+    filter_mode: ['all', 'files', 'videos', 'custom'].includes(body.filter_mode) ? body.filter_mode : 'all',
+    file_extensions: normalizeExtensions(body.file_extensions, DEFAULT_FILE_EXTENSIONS),
+    video_extensions: normalizeExtensions(body.video_extensions, DEFAULT_VIDEO_EXTENSIONS),
+  }
+}
+
 async function dispatchJob(kind, payload) {
   const jobId = crypto.randomUUID()
   const inputs = { kind, job_id: jobId, payload: JSON.stringify(payload) }
@@ -706,7 +812,7 @@ globalThis.__ownerToolLogCache = logCache
 // Only these lines carry signal for the operator (per-item results, scan
 // progress, summaries, errors). Everything else (pip install, checkout, cache…)
 // is GitHub Actions setup noise and gets dropped.
-const LOG_KEEP = /^\[(OK|ERR|DRY|WARN|AUTH ERR|scan|skip)\]|^\$ |^Done\.|^Resolved |^Found |^Hoàn tất|^Owner Video Tool|transferred=|blocked=|unblocked=|failed=|Transfer .*->|->|^BLOCK |^UNBLOCK |Traceback|Exception/
+const LOG_KEEP = /^\[(OK|ERR|DRY|WARN|AUTH ERR|scan|skip|checkpoint|report)\]|^\$ |^Done\.|^Resolved |^Found |^Copy Drive|^Hoàn tất|^Owner Video Tool|transferred=|blocked=|unblocked=|failed=|Transfer .*->|->|^BLOCK |^UNBLOCK |Traceback|Exception/
 
 function cleanLogLine(line) {
   let text = line.replace(/\r$/, '')
@@ -908,6 +1014,96 @@ async function handleBlock(body) {
   return newJob('block', logs, failed ? 'failed' : 'completed', failed ? 1 : 0)
 }
 
+async function handleCopyDrive(body) {
+  const payload = buildCopyDrivePayload(body)
+  const logs = []
+  const owner = findAccount('A', payload.owner_email)
+  if (!owner) throw Object.assign(new Error('Account A is not registered'), { status: 400 })
+  const drive = driveFromToken(owner.token)
+  const dest = await getFile(drive, payload.dest)
+  if (dest.mimeType !== FOLDER_MIME) throw Object.assign(new Error(`Drive đích không phải folder: ${payload.dest}`), { status: 422 })
+  const copiedIds = new Set()
+  const excluded = String(payload.exclude || '').split(/[,;\n]+/).map(x => x.trim().toLowerCase()).filter(Boolean)
+  const filtered = item => copyFilterAccept(item, payload.filter_mode, payload.file_extensions, payload.video_extensions)
+  const excludedByName = name => excluded.some(term => String(name || '').toLowerCase().includes(term))
+  let copiedRoots = 0
+  let blocked = 0
+  let errors = 0
+
+  if (payload.checkpoint) {
+    logs.push('[WARN] Serverless fallback không lưu checkpoint. Bật GitHub Actions dispatch hoặc chạy local để dùng .clone_checkpoint.json.')
+  }
+  logs.push(`Copy Drive: account=${owner.email} sources=${payload.sources.length} dest=${dest.name} filter=${payload.filter_mode} dry_run=${payload.dry_run}`)
+
+  async function copyTree(item, destId) {
+    for (const child of await listChildren(drive, item.id)) {
+      if (excludedByName(child.name)) {
+        logs.push(`[skip] excluded ${child.name}`)
+        continue
+      }
+      if (child.mimeType === FOLDER_MIME) {
+        if (!payload.recursive) continue
+        const nextDest = await ensureCopyFolder(drive, destId, child.name, logs, payload.dry_run)
+        await copyTree(child, nextDest)
+        continue
+      }
+      if (!filtered(child)) continue
+      if (!child.canCopy) {
+        blocked += 1
+        logs.push(`[WARN] blocked/cannot copy ${child.name}`)
+        continue
+      }
+      try {
+        await copyDriveFile(drive, child, destId, copiedIds, logs, payload.dry_run)
+      } catch (error) {
+        errors += 1
+        logs.push(`[ERR]  ${child.name}: ${error.message || error}`)
+      }
+    }
+  }
+
+  await runPool(payload.sources, payload.workers, async (sourceId) => {
+    let item
+    try {
+      item = await getFile(drive, sourceId)
+    } catch (error) {
+      errors += 1
+      logs.push(`[ERR]  ID ${sourceId}: ${error.message || error}`)
+      return
+    }
+    logs.push(`[scan] ${item.name}`)
+    if (excludedByName(item.name)) {
+      logs.push(`[skip] excluded source ${item.name}`)
+      return
+    }
+    try {
+      if (item.mimeType === FOLDER_MIME) {
+        const rootDest = await ensureCopyFolder(drive, payload.dest, item.name, logs, payload.dry_run)
+        await copyTree(item, rootDest)
+        copiedRoots += 1
+        return
+      }
+      if (!filtered(item)) {
+        logs.push(`[skip] filtered ${item.name}`)
+        return
+      }
+      if (!item.canCopy) {
+        blocked += 1
+        logs.push(`[WARN] blocked/cannot copy ${item.name}`)
+        return
+      }
+      const newId = await copyDriveFile(drive, item, payload.dest, copiedIds, logs, payload.dry_run)
+      if (newId) copiedRoots += 1
+    } catch (error) {
+      errors += 1
+      logs.push(`[ERR]  ${item.name}: ${error.message || error}`)
+    }
+  })
+
+  logs.push(`Done. copied_roots=${copiedRoots} blocked=${blocked} errors=${errors}`)
+  return newJob('copy-drive', logs, errors ? 'failed' : 'completed', errors ? 1 : 0)
+}
+
 async function getBody(req) {
   if (req.body && typeof req.body === 'object') return req.body
   if (typeof req.body === 'string' && req.body) return JSON.parse(req.body)
@@ -1065,6 +1261,12 @@ export default async function handler(req, res) {
       const body = await getBody(req)
       if (DISPATCH_MODE) return json(res, 202, await dispatchJob('block', buildBlockPayload(body)))
       return json(res, 202, await handleBlock(body))
+    }
+
+    if (route === '/jobs/copy-drive' && req.method === 'POST') {
+      const body = await getBody(req)
+      if (DISPATCH_MODE) return json(res, 202, await dispatchJob('copy-drive', buildCopyDrivePayload(body)))
+      return json(res, 202, await handleCopyDrive(body))
     }
 
     if (parts[0] === 'jobs' && parts[1] && parts[2] === 'stop' && req.method === 'POST') {
