@@ -31,6 +31,8 @@ const DISPATCH_MODE = Boolean(GITHUB_REPO && GITHUB_TOKEN)
 const jobs = globalThis.__ownerToolJobs || new Map()
 globalThis.__ownerToolJobs = jobs
 globalThis.__ownerToolActiveA = globalThis.__ownerToolActiveA || ''
+const folderCreateLocks = globalThis.__ownerToolFolderCreateLocks || new Map()
+globalThis.__ownerToolFolderCreateLocks = folderCreateLocks
 
 function json(res, status, payload) {
   res.status(status).setHeader('Content-Type', 'application/json; charset=utf-8')
@@ -332,7 +334,7 @@ async function listChildren(drive, folderId) {
   let pageToken
   do {
     const { data } = await drive.files.list({
-      q: `'${folderId.replace(/'/g, "\\'")}' in parents and trashed = false`,
+      q: `'${driveQueryText(folderId)}' in parents and trashed = false`,
       fields: 'nextPageToken,files(id,name,mimeType,owners(emailAddress),ownedByMe,capabilities(canCopy))',
       pageSize: 1000,
       pageToken,
@@ -354,6 +356,60 @@ async function listChildren(drive, folderId) {
 
 function driveQueryText(value) {
   return String(value || '').replace(/\\/g, '\\\\').replace(/'/g, "\\'")
+}
+
+function normalizeDriveName(name) {
+  return String(name || '')
+    .normalize('NFKC')
+    .replace(/[\u00a0\u200b\u200c\u200d\ufeff]/g, char => (char === '\u00a0' ? ' ' : ''))
+    .replace(/\s+/g, ' ')
+    .trim()
+    .toLowerCase()
+}
+
+function looseDriveFolderName(name) {
+  return normalizeDriveName(name)
+    .replace(/[_|\u00a6\u2016\uff5c\-\u2010\u2011\u2012\u2013\u2014\u2015]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim()
+}
+
+function findMatchingChild(items, name, mimeType = '') {
+  let normalizedMatch = null
+  let looseMatch = null
+  let looseAmbiguous = false
+  const normalizedName = normalizeDriveName(name)
+  const looseName = mimeType === FOLDER_MIME ? looseDriveFolderName(name) : ''
+
+  for (const item of items) {
+    if (mimeType && item.mimeType !== mimeType) continue
+    const itemName = String(item.name || '')
+    if (itemName === name) return item
+    if (!normalizedMatch && normalizeDriveName(itemName) === normalizedName) normalizedMatch = item
+    if (looseName && looseDriveFolderName(itemName) === looseName) {
+      if (!looseMatch) looseMatch = item
+      else if (looseMatch.id !== item.id) looseAmbiguous = true
+    }
+  }
+
+  if (normalizedMatch) return normalizedMatch
+  if (looseAmbiguous) return null
+  return looseMatch
+}
+
+async function withFolderCreateLock(parentId, name, fn) {
+  const key = `${parentId}\0${looseDriveFolderName(name)}`
+  const previous = folderCreateLocks.get(key) || Promise.resolve()
+  let release
+  const current = new Promise(resolve => { release = resolve })
+  folderCreateLocks.set(key, current)
+  await previous.catch(() => {})
+  try {
+    return await fn()
+  } finally {
+    release()
+    if (folderCreateLocks.get(key) === current) folderCreateLocks.delete(key)
+  }
 }
 
 function normalizeExtensions(items, fallback) {
@@ -382,28 +438,36 @@ async function findExistingChild(drive, parentId, name, mimeType = '') {
   if (mimeType) q += ` and mimeType='${driveQueryText(mimeType)}'`
   const { data } = await drive.files.list({
     q,
-    fields: 'files(id,name)',
+    fields: 'files(id,name,mimeType)',
     pageSize: 1,
     supportsAllDrives: true,
     includeItemsFromAllDrives: true,
   })
-  return data.files?.[0]?.id || ''
+  if (data.files?.[0]?.id) return data.files[0].id
+
+  const match = findMatchingChild(await listChildren(drive, parentId), name, mimeType)
+  return match?.id || ''
 }
 
 async function ensureCopyFolder(drive, parentId, name, logs, dryRun) {
-  const existing = await findExistingChild(drive, parentId, name, FOLDER_MIME)
-  if (existing) return existing
-  if (dryRun) {
-    logs.push(`[DRY]  folder ${name}`)
-    return parentId
-  }
-  const { data } = await drive.files.create({
-    requestBody: { name, mimeType: FOLDER_MIME, parents: [parentId] },
-    fields: 'id',
-    supportsAllDrives: true,
+  return withFolderCreateLock(parentId, name, async () => {
+    const existing = await findExistingChild(drive, parentId, name, FOLDER_MIME)
+    if (existing) {
+      logs.push(`[skip] folder exists ${name}`)
+      return existing
+    }
+    if (dryRun) {
+      logs.push(`[DRY]  folder ${name}`)
+      return parentId
+    }
+    const { data } = await drive.files.create({
+      requestBody: { name, mimeType: FOLDER_MIME, parents: [parentId] },
+      fields: 'id',
+      supportsAllDrives: true,
+    })
+    logs.push(`[OK]   folder ${name}`)
+    return data.id
   })
-  logs.push(`[OK]   folder ${name}`)
-  return data.id
 }
 
 async function copyDriveFile(drive, item, destId, copiedIds, logs, dryRun) {

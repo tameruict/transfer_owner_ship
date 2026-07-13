@@ -37,7 +37,7 @@ if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from auto_transfer_videos import extract_folder_id
-from drive_common import FOLDER_MIME_TYPE, SHORTCUT_MIME_TYPE, drive_query_literal
+from drive_common import FOLDER_MIME_TYPE, SHORTCUT_MIME_TYPE, drive_query_literal, find_matching_item
 from transfer_ownership import (
     OAuthTokenError,
     ServiceFactory,
@@ -164,6 +164,7 @@ class DriveCopyRunner:
         self.dry_run = dry_run
         self.report_dir = report_dir
         self.lock = threading.RLock()
+        self.folder_create_lock = threading.RLock()
         self.processed_ids: set[str] = set()
         self.checkpoint_file_id: str | None = None
         self.success_rows: list[dict[str, Any]] = []
@@ -279,14 +280,14 @@ class DriveCopyRunner:
             return bool(allowed) and any(name.endswith(ext) for ext in allowed)
         return True
 
-    def find_existing(self, parent_id: str, name: str, mime_type: str | None = None) -> str | None:
+    def find_existing_by_query(self, parent_id: str, name: str, mime_type: str | None = None) -> str | None:
         q = f"'{drive_query_literal(parent_id)}' in parents and name='{drive_query_literal(name)}' and trashed=false"
         if mime_type:
             q += f" and mimeType='{drive_query_literal(mime_type)}'"
         payload = execute_with_retry(
             self.service().files().list(
                 q=q,
-                fields="files(id,name)",
+                fields="files(id,name,mimeType)",
                 pageSize=1,
                 supportsAllDrives=True,
                 includeItemsFromAllDrives=True,
@@ -295,22 +296,36 @@ class DriveCopyRunner:
         files = payload.get("files", [])
         return str(files[0]["id"]) if files else None
 
-    def create_folder(self, parent_id: str, name: str) -> str:
-        existing = self.find_existing(parent_id, name, FOLDER_MIME_TYPE)
+    def find_existing(self, parent_id: str, name: str, mime_type: str | None = None) -> str | None:
+        existing = self.find_existing_by_query(parent_id, name, mime_type)
         if existing:
             return existing
-        if self.dry_run:
-            print(f"[DRY]  folder {name}")
-            return parent_id
-        payload = execute_with_retry(
-            self.service().files().create(
-                body={"name": name, "mimeType": FOLDER_MIME_TYPE, "parents": [parent_id]},
-                fields="id",
-                supportsAllDrives=True,
+
+        children = [
+            {"id": child.id, "name": child.name, "mimeType": child.mime_type}
+            for child in self.list_children(parent_id)
+        ]
+        match = find_matching_item(children, name, mime_type)
+        return str(match["id"]) if match else None
+
+    def create_folder(self, parent_id: str, name: str) -> str:
+        with self.folder_create_lock:
+            existing = self.find_existing(parent_id, name, FOLDER_MIME_TYPE)
+            if existing:
+                print(f"[skip] folder exists {name}")
+                return existing
+            if self.dry_run:
+                print(f"[DRY]  folder {name}")
+                return parent_id
+            payload = execute_with_retry(
+                self.service().files().create(
+                    body={"name": name, "mimeType": FOLDER_MIME_TYPE, "parents": [parent_id]},
+                    fields="id",
+                    supportsAllDrives=True,
+                )
             )
-        )
-        print(f"[OK]   folder {name}")
-        return str(payload["id"])
+            print(f"[OK]   folder {name}")
+            return str(payload["id"])
 
     def copy_file(self, item: DriveEntry, dest_id: str) -> str | None:
         if item.id in self.processed_ids:
