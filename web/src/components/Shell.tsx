@@ -1,4 +1,4 @@
-import { Ban, Clock3, Copy, FolderKey, LogOut, Menu, Repeat2, UsersRound, X } from 'lucide-react'
+import { Ban, Clock3, Copy, Download, FolderKey, LogOut, Menu, Repeat2, UsersRound, X } from 'lucide-react'
 import type { ReactNode } from 'react'
 import type { Account, View } from '../types'
 
@@ -6,6 +6,7 @@ const items: Array<{ id: View; label: string; icon: typeof Repeat2 }> = [
   { id: 'copy-drive', label: 'Copy Drive', icon: Copy },
   { id: 'transfer', label: 'Chuyển owner', icon: Repeat2 },
   { id: 'block', label: 'Chặn tải xuống', icon: Ban },
+  { id: 'unblock', label: 'Cho phép tải xuống', icon: Download },
   { id: 'accounts', label: 'Tài khoản', icon: UsersRound },
   { id: 'history', label: 'Lịch sử', icon: Clock3 },
 ]
@@ -25,6 +26,6 @@ export function Shell({ children, view, onView, account, accountsA, onAccount, c
       <button className="icon-button logout-button" onClick={onLogout} aria-label="Đăng xuất"><LogOut size={20} /><span>Đăng xuất</span></button>
     </header>
     <main>{children}</main>
-    <nav className="bottom-nav">{items.map(({ id, label, icon: Icon }) => <button key={id} className={view === id ? 'active' : ''} onClick={() => onView(id)}><Icon size={20} /><span>{label.replace('Chuyển owner', 'Chuyển')}</span></button>)}</nav>
+    <nav className="bottom-nav">{items.map(({ id, label, icon: Icon }) => <button key={id} className={view === id ? 'active' : ''} onClick={() => onView(id)}><Icon size={20} /><span>{label.replace('Chuyển owner', 'Chuyển').replace('Cho phép tải xuống', 'Cho phép tải')}</span></button>)}</nav>
   </div>
 }

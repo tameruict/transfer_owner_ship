@@ -712,7 +712,7 @@ def block(request: BlockRequest) -> dict:
     if request.recursive: cmd.append("--recursive")
     if request.unblock: cmd.append("--unblock")
     if request.dry_run: cmd.append("--dry-run")
-    job = start_job("block", [cmd])
+    job = start_job("unblock" if request.unblock else "block", [cmd])
     return {"job_id": job.id, "id": job.id, "type": job.kind, "status": job.status}
 
 

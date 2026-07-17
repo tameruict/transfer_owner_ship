@@ -1075,7 +1075,7 @@ async function handleBlock(body) {
     }
   })
   logs.push(`Done. ${action.toLowerCase()}ed=${success}, failed=${failed}`)
-  return newJob('block', logs, failed ? 'failed' : 'completed', failed ? 1 : 0)
+  return newJob(restricted ? 'block' : 'unblock', logs, failed ? 'failed' : 'completed', failed ? 1 : 0)
 }
 
 async function handleCopyDrive(body) {
@@ -1323,8 +1323,9 @@ export default async function handler(req, res) {
 
     if (route === '/jobs/block' && req.method === 'POST') {
       const body = await getBody(req)
-      if (DISPATCH_MODE) return json(res, 202, await dispatchJob('block', buildBlockPayload(body)))
-      return json(res, 202, await handleBlock(body))
+      const payload = buildBlockPayload(body)
+      if (DISPATCH_MODE) return json(res, 202, await dispatchJob(payload.unblock ? 'unblock' : 'block', payload))
+      return json(res, 202, await handleBlock(payload))
     }
 
     if (route === '/jobs/copy-drive' && req.method === 'POST') {

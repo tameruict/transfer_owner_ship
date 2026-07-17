@@ -48,11 +48,11 @@ export default function App() {
   }, [refreshAccounts])
   useEffect(() => {
     if (!job?.id || !['queued', 'running'].includes(job.status || '')) return
-    const timer = window.setInterval(async () => { try { const next = await api.job(job.id); setJob(prev => prev ? { ...prev, ...next } : next); setJobs(all => all.map(item => item.id === next.id ? { ...item, ...next } : item)) } catch (error) { setNotice((error as Error).message) } }, 1500)
+    const timer = window.setInterval(async () => { try { const next = await api.job(job.id); setJob(prev => prev ? { ...prev, ...next, type: next.type || prev.type } : next); setJobs(all => all.map(item => item.id === next.id ? { ...item, ...next, type: next.type || item.type } : item)) } catch (error) { setNotice((error as Error).message) } }, 1500)
     return () => window.clearInterval(timer)
   }, [job?.id, job?.status])
 
-  const startJob = async (kind: 'transfer' | 'block' | 'copy-drive', payload: unknown) => { setLoading(true); setNotice(''); try { const next = kind === 'transfer' ? await api.startTransfer(payload) : kind === 'copy-drive' ? await api.startCopyDrive(payload) : await api.startBlock(payload); const normalized = { ...next, type: next.type || kind }; setJob(normalized); setJobs(all => [normalized, ...all.filter(item => item.id !== normalized.id)]); setLogsOpen(true) } catch (error) { setNotice((error as Error).message) } finally { setLoading(false) } }
+  const startJob = async (kind: 'transfer' | 'block' | 'unblock' | 'copy-drive', payload: unknown) => { setLoading(true); setNotice(''); try { const next = kind === 'transfer' ? await api.startTransfer(payload) : kind === 'copy-drive' ? await api.startCopyDrive(payload) : await api.startBlock(payload); const normalized = { ...next, type: next.type || kind }; setJob(normalized); setJobs(all => [normalized, ...all.filter(item => item.id !== normalized.id)]); setLogsOpen(true) } catch (error) { setNotice((error as Error).message) } finally { setLoading(false) } }
   const connectAccount = (role: Role) => {
     setNotice('')
     // Redirect-based Google web OAuth. /api/oauth/start 302s to Google; after
@@ -87,7 +87,8 @@ export default function App() {
         {notice && <div className="notice" role="alert"><span>{notice}</span><button onClick={() => setNotice('')}>×</button></div>}
         {view === 'transfer' && <TransferForm accounts={accounts} ownerEmail={activeA?.email || ''} busy={loading} onSubmit={payload => startJob('transfer', payload)} />}
         {view === 'copy-drive' && <CopyDriveForm ownerEmail={activeA?.email || ''} busy={loading} onSubmit={payload => startJob('copy-drive', payload)} />}
-        {view === 'block' && <BlockForm ownerEmail={activeA?.email || ''} busy={loading} onSubmit={payload => startJob('block', payload)} />}
+        {view === 'block' && <BlockForm key="block" ownerEmail={activeA?.email || ''} busy={loading} onSubmit={payload => startJob('block', payload)} />}
+        {view === 'unblock' && <BlockForm mode="allow" ownerEmail={activeA?.email || ''} busy={loading} onSubmit={payload => startJob('unblock', payload)} />}
         {view === 'accounts' && <Accounts accounts={accounts} loading={loading} onConnect={connectAccount} onActivate={activate} onDelete={removeAccount} />}
         {view === 'history' && <History jobs={jobs} onSelect={selected => { setJob(selected); setLogsOpen(true) }} />}
       </div>

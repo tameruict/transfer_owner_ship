@@ -5,7 +5,7 @@ on:
   workflow_dispatch:
     inputs:
       kind:
-        description: "transfer | block | copy-drive"
+        description: "transfer | block | unblock | copy-drive"
         required: true
         type: string
       job_id:
