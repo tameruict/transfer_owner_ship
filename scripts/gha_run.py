@@ -239,6 +239,8 @@ def run_block(payload, paths):
         cmd += ["--recursive"]
     if payload.get("unblock"):
         cmd += ["--unblock"]
+    if payload.get("target") in {"videos", "files", "sheets"}:
+        cmd += ["--target", payload["target"]]
     if payload.get("dry_run"):
         cmd += ["--dry-run"]
     action = "UNBLOCK" if payload.get("unblock") else "BLOCK"

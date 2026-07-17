@@ -12,6 +12,7 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url))
 const ROOT = path.resolve(__dirname, '..')
 const FOLDER_MIME = 'application/vnd.google-apps.folder'
 const SHORTCUT_MIME = 'application/vnd.google-apps.shortcut'
+const GOOGLE_SHEETS_MIME = 'application/vnd.google-apps.spreadsheet'
 const VIDEO_PREFIX = 'video/'
 const DEFAULT_FILE_EXTENSIONS = ['.pdf', '.doc', '.docx', '.rtf', '.txt', '.ppt', '.pptx', '.xls', '.xlsx', '.csv', '.mp3', '.wav', '.m4a', '.aac']
 const DEFAULT_VIDEO_EXTENSIONS = ['.mp4', '.mov', '.mkv', '.avi', '.webm', '.m4v', '.wmv', '.flv', '.mpeg', '.mpg']
@@ -720,7 +721,7 @@ async function transferConsumer(ownerDrive, acceptDrive, item, email, notify) {
 }
 
 async function setCopyRestriction(drive, fileId, restricted) {
-  await drive.files.update({
+  const { data } = await drive.files.update({
     fileId,
     requestBody: {
       downloadRestrictions: {
@@ -733,6 +734,18 @@ async function setCopyRestriction(drive, fileId, restricted) {
     fields: 'id,copyRequiresWriterPermission,downloadRestrictions',
     supportsAllDrives: true,
   })
+  const restrictions = data.downloadRestrictions || {}
+  const effective = restrictions.effectiveDownloadRestrictionWithContext || {}
+  const item = restrictions.itemDownloadRestriction || {}
+  const readerRestricted = Boolean(effective.restrictedForReaders ?? item.restrictedForReaders)
+  const writerRestricted = Boolean(effective.restrictedForWriters ?? item.restrictedForWriters)
+  if (readerRestricted !== restricted || writerRestricted !== restricted) {
+    throw new Error(`Drive did not apply restricted=${restricted} for readers and writers`)
+  }
+}
+
+function isGoogleSheet(item) {
+  return String(item.mimeType || '') === GOOGLE_SHEETS_MIME
 }
 
 function newJob(type, logs, status = 'completed', returnCode = 0) {
@@ -802,6 +815,9 @@ function buildBlockPayload(body) {
     folders,
     recursive: body.recursive !== false,
     unblock: Boolean(body.unblock),
+    target: ['videos', 'files', 'sheets'].includes(body.target)
+      ? body.target
+      : (body.unblock ? 'files' : 'videos'),
     dry_run: Boolean(body.dry_run),
     workers: clampWorkers(body.workers),
   }
@@ -1051,11 +1067,13 @@ async function handleBlock(body) {
   const folderIds = (body.folders || []).map(extractFolderId)
   if (!folderIds.length) throw Object.assign(new Error('Cần ít nhất một folder'), { status: 422 })
   const workers = clampWorkers(body.workers)
-  // Block only ever targets videos (video/*); PDFs, MP3s and slides stay downloadable.
-  const targets = await collectVideos(drive, folderIds, body.recursive !== false, logs, isVideo)
   const restricted = !body.unblock
   const action = restricted ? 'BLOCK' : 'UNBLOCK'
-  logs.push(`Found ${targets.length} video(s) across ${folderIds.length} folder(s). action=${action} workers=${workers} dry_run=${Boolean(body.dry_run)}`)
+  const target = ['videos', 'files', 'sheets'].includes(body.target) ? body.target : (restricted ? 'videos' : 'files')
+  const accept = target === 'videos' ? isVideo : target === 'sheets' ? isGoogleSheet : isBlockableFile
+  const targetLabel = target === 'videos' ? 'video(s)' : target === 'sheets' ? 'sheet(s)' : 'file(s)'
+  const targets = await collectVideos(drive, folderIds, body.recursive !== false, logs, accept)
+  logs.push(`Found ${targets.length} ${targetLabel} across ${folderIds.length} folder(s). target=${target} action=${action} workers=${workers} dry_run=${Boolean(body.dry_run)}`)
   let success = 0
   let failed = 0
   await runPool(targets, body.dry_run ? 1 : workers, async (item) => {

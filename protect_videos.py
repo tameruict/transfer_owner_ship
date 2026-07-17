@@ -7,8 +7,8 @@ Two operations on the VIDEO files found inside one or more Drive folders
             Reuses the consumer (pending-owner) or workspace (direct) flow
             from transfer_ownership.py.
 
-  block     Set Google Drive's download restriction on every
-            video. This disables Download / Copy / Print for non-owners
+  block     Set or remove Google Drive's download restriction on videos or
+            all files. This controls Download / Copy / Print for non-owners
             (readers, commenters and writers). Owners are unaffected.
 
 IMPORTANT ordering note
@@ -53,7 +53,9 @@ from __future__ import annotations
 import argparse
 import sys
 import time
+from collections import deque
 from collections.abc import Callable, Iterable
+from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from pathlib import Path
 
 # Windows consoles default to cp1252, which cannot encode Vietnamese file names
@@ -88,13 +90,16 @@ from transfer_ownership import (
 )
 
 
+GOOGLE_SHEETS_MIME_TYPE = "application/vnd.google-apps.spreadsheet"
+
+
 def _error_hint(exc: HttpError) -> str:
     """A short, human-readable hint appended to error lines for common cases."""
     status = _http_status(exc)
     if status == 403:
         return (
-            " (HTTP 403 — the token may not OWN this file; if you already "
-            "transferred it, block/transfer with account B's token instead)"
+            " (HTTP 403 — the token may not OWN this file; use the current "
+            "owner's token to change its download restriction)"
         )
     if status == 404:
         return " (HTTP 404 — file not found or no access with this token)"
@@ -106,14 +111,25 @@ def is_video(item: DriveItem) -> bool:
     return item.mime_type.startswith("video/")
 
 
+def is_google_sheet(item: DriveItem) -> bool:
+    """True for Google Sheets files."""
+    return item.mime_type == GOOGLE_SHEETS_MIME_TYPE
+
+
 def is_blockable_file(item: DriveItem) -> bool:
     """True for any real, downloadable file (not a folder or shortcut).
 
-    Used by the transfer flow's "files" scope so PDFs, slides and other course
-    material move ownership alongside the videos. The block flow deliberately
-    does NOT use this — it only restricts videos (see :func:`is_video`).
+    This includes uploaded files and native Google files. Folders and shortcuts
+    are excluded because Drive's item download restriction applies to files.
     """
     return item.mime_type not in (FOLDER_MIME_TYPE, SHORTCUT_MIME_TYPE)
+
+
+BLOCK_TARGETS: dict[str, tuple[Callable[[DriveItem], bool], str]] = {
+    "videos": (is_video, "video(s)"),
+    "files": (is_blockable_file, "file(s)"),
+    "sheets": (is_google_sheet, "sheet(s)"),
+}
 
 
 def collect_videos(
@@ -121,6 +137,7 @@ def collect_videos(
     folder_ids: Iterable[str],
     *,
     recursive: bool,
+    max_depth: int | None = None,
     accept: Callable[[DriveItem], bool] = is_video,
 ) -> list[DriveItem]:
     """Return every matching file inside the given folders.
@@ -128,6 +145,8 @@ def collect_videos(
     ``accept`` decides which files are collected (videos only by default).
     Each folder id is walked breadth-first when recursive=True. Shortcuts and
     sub-folders are traversed for discovery but never collected themselves.
+    ``max_depth`` limits recursive folder traversal below each root; files in a
+    folder at that depth are still considered, but deeper sub-folders are not.
     """
     matches: list[DriveItem] = []
     seen_ids: set[str] = set()
@@ -142,27 +161,144 @@ def collect_videos(
                 matches.append(root)
             continue
 
-        queue = [root]
+        queue = deque([(root, 0)])
         while queue:
-            folder = queue.pop(0)
+            folder, depth = queue.popleft()
             if folder.id in visited_folders:
                 continue
             visited_folders.add(folder.id)
-            print(
-                f"[scan] {folder.name} — files so far: {len(matches)}",
-                flush=True,
-            )
+            if len(visited_folders) == 1 or len(visited_folders) % 50 == 0:
+                print(
+                    f"[scan] folders={len(visited_folders)} files so far={len(matches)}",
+                    flush=True,
+                )
 
             for child in list_folder_children(service, folder.id):
                 if child.mime_type == FOLDER_MIME_TYPE:
-                    if recursive:
-                        queue.append(child)
+                    if recursive and (max_depth is None or depth < max_depth):
+                        queue.append((child, depth + 1))
                     continue
                 if child.mime_type == SHORTCUT_MIME_TYPE:
                     continue
                 if accept(child) and child.id not in seen_ids:
                     seen_ids.add(child.id)
                     matches.append(child)
+
+    return matches
+
+
+def collect_files_parallel(
+    factories: Iterable[ServiceFactory],
+    folder_ids: Iterable[str],
+    *,
+    recursive: bool,
+    max_depth: int | None,
+    accept: Callable[[DriveItem], bool],
+    workers: int,
+) -> list[DriveItem]:
+    """Threaded folder discovery for large Drive trees.
+
+    The Drive service object is not thread-safe, so workers obtain their own
+    thread-local service from a factory before listing folder children. For
+    every root/sub-folder, tokens are tried in order until one has access. This
+    avoids failing the whole scan merely because the first valid token cannot
+    see a folder that another supplied token can see.
+    """
+    factory_list = list(factories)
+    if not factory_list:
+        raise ValueError("At least one Drive service factory is required")
+    matches: list[DriveItem] = []
+    seen_files: set[str] = set()
+    scheduled_folders: set[str] = set()
+    pending: deque[tuple[ServiceFactory, DriveItem, int]] = deque()
+    completed_folders = 0
+
+    def add_match(item: DriveItem) -> None:
+        if item.id not in seen_files and accept(item):
+            seen_files.add(item.id)
+            matches.append(item)
+
+    def try_with_access(
+        preferred: ServiceFactory,
+        operation: Callable[[ServiceFactory], DriveItem | list[DriveItem]],
+    ) -> tuple[ServiceFactory, DriveItem | list[DriveItem]]:
+        candidates = [preferred, *(item for item in factory_list if item is not preferred)]
+        last_access_error: HttpError | None = None
+        for candidate in candidates:
+            try:
+                return candidate, operation(candidate)
+            except HttpError as exc:
+                if _http_status(exc) not in (403, 404):
+                    raise
+                last_access_error = exc
+        assert last_access_error is not None
+        raise last_access_error
+
+    def get_root(folder_id: str) -> tuple[ServiceFactory, DriveItem]:
+        factory, result = try_with_access(
+            factory_list[0], lambda candidate: get_file(candidate.primary, folder_id)
+        )
+        assert isinstance(result, DriveItem)
+        return factory, result
+
+    def list_one(
+        preferred: ServiceFactory, folder: DriveItem, depth: int
+    ) -> tuple[ServiceFactory, DriveItem, int, list[DriveItem]]:
+        factory, result = try_with_access(
+            preferred,
+            lambda candidate: list_folder_children(candidate.get(), folder.id),
+        )
+        assert isinstance(result, list)
+        return factory, folder, depth, result
+
+    for folder_id in folder_ids:
+        factory, root = get_root(folder_id)
+        if root.mime_type == FOLDER_MIME_TYPE:
+            if root.id not in scheduled_folders:
+                scheduled_folders.add(root.id)
+                pending.append((factory, root, 0))
+        else:
+            add_match(root)
+
+    max_workers = max(1, workers)
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures: dict[
+            Future[tuple[ServiceFactory, DriveItem, int, list[DriveItem]]], None
+        ] = {}
+
+        def fill_pool() -> None:
+            while pending and len(futures) < max_workers:
+                factory, folder, depth = pending.popleft()
+                futures[executor.submit(list_one, factory, folder, depth)] = None
+
+        fill_pool()
+        while futures:
+            done, _ = wait(futures, return_when=FIRST_COMPLETED)
+            for future in done:
+                futures.pop(future, None)
+                factory, folder, depth, children = future.result()
+                completed_folders += 1
+                if completed_folders == 1 or completed_folders % 50 == 0:
+                    print(
+                        f"[scan] folders={completed_folders} files so far={len(matches)}",
+                        flush=True,
+                    )
+
+                for child in children:
+                    if child.mime_type == FOLDER_MIME_TYPE:
+                        if (
+                            recursive
+                            and (max_depth is None or depth < max_depth)
+                            and child.id not in scheduled_folders
+                        ):
+                            scheduled_folders.add(child.id)
+                            pending.append((factory, child, depth + 1))
+                        continue
+                    if child.mime_type == SHORTCUT_MIME_TYPE:
+                        continue
+                    add_match(child)
+
+            fill_pool()
 
     return matches
 
@@ -204,7 +340,12 @@ def run_transfer(args: argparse.Namespace) -> int:
             )
 
     expected_owner_email = get_authenticated_email(owner_service)
-    videos = collect_videos(owner_service, args.folder_id, recursive=args.recursive)
+    videos = collect_videos(
+        owner_service,
+        args.folder_id,
+        recursive=args.recursive,
+        max_depth=args.max_depth,
+    )
     print(
         f"Found {len(videos)} video(s) across {len(args.folder_id)} folder(s). "
         f"mode={args.mode} owner_filter={expected_owner_email or 'unknown'} "
@@ -273,7 +414,7 @@ def _download_restriction_payload(restricted: bool) -> dict:
     }
 
 
-def _download_restrictions_are_applied(info: dict) -> bool:
+def _download_restriction_values(info: dict) -> tuple[bool, bool]:
     restrictions = info.get("downloadRestrictions") or {}
     effective = restrictions.get("effectiveDownloadRestrictionWithContext") or {}
     item = restrictions.get("itemDownloadRestriction") or {}
@@ -284,10 +425,14 @@ def _download_restrictions_are_applied(info: dict) -> bool:
     writer_restricted = bool(
         effective.get("restrictedForWriters", item.get("restrictedForWriters", False))
     )
-    return reader_restricted and writer_restricted
+    return reader_restricted, writer_restricted
 
 
-def get_copy_restriction(service, file_id: str) -> bool:
+def _download_restrictions_match(info: dict, restricted: bool) -> bool:
+    return all(value == restricted for value in _download_restriction_values(info))
+
+
+def copy_restriction_matches(service, file_id: str, *, restricted: bool) -> bool:
     info = execute_with_retry(
         service.files().get(
             fileId=file_id,
@@ -299,11 +444,11 @@ def get_copy_restriction(service, file_id: str) -> bool:
             supportsAllDrives=True,
         )
     )
-    return _download_restrictions_are_applied(info)
+    return _download_restrictions_match(info, restricted)
 
 
 def set_copy_restriction(service, file_id: str, *, restricted: bool) -> bool:
-    """Set Drive's download restriction and return the stored value for verify."""
+    """Set Drive's restriction and verify both reader and writer values."""
     info = execute_with_retry(
         service.files().update(
             fileId=file_id,
@@ -316,7 +461,7 @@ def set_copy_restriction(service, file_id: str, *, restricted: bool) -> bool:
             supportsAllDrives=True,
         )
     )
-    return _download_restrictions_are_applied(info)
+    return _download_restrictions_match(info, restricted)
 
 
 class OwnerRouter:
@@ -332,11 +477,11 @@ class OwnerRouter:
 
     def __init__(self, token_paths: Iterable[str]) -> None:
         self.factories_by_email: dict[str, ServiceFactory] = {}
+        self.factories: list[ServiceFactory] = []
         self.emails: list[str] = []
         self.skipped_token_errors: list[str] = []
-        # The first successfully loaded token scans the folders; any token with
-        # shared access to the folder can enumerate children (each child still
-        # reports its real owner), so routing does not depend on which one scans.
+        # Kept as the default/fallback owner service. Folder discovery itself
+        # tries every loaded factory when an earlier token has no access.
         self.scanner: ServiceFactory | None = None
         seen_paths: set[str] = set()
         token_path_list = [str(raw_path).strip() for raw_path in token_paths]
@@ -368,6 +513,7 @@ class OwnerRouter:
                 # first, ignore the rest so we never double-count an owner.
                 continue
             self.factories_by_email[key] = factory
+            self.factories.append(factory)
             self.emails.append(email)
             if self.scanner is None:
                 self.scanner = factory
@@ -375,12 +521,12 @@ class OwnerRouter:
         if self.scanner is None:
             raise OAuthTokenError(
                 next((path for path in token_path_list if path), "token.json"),
-                "No usable owner tokens were provided for block.",
+                "No usable owner tokens were provided for block/unblock.",
             )
 
     def _skip_unusable_token(self, reason: str) -> None:
         self.skipped_token_errors.append(reason)
-        print(f"[WARN] Skipping unusable block token: {reason}", file=sys.stderr)
+        print(f"[WARN] Skipping unusable restriction token: {reason}", file=sys.stderr)
 
     def factory_for(self, item: DriveItem) -> ServiceFactory | None:
         """Return the token factory that owns ``item``, or None if unmatched.
@@ -408,14 +554,16 @@ def run_block(args: argparse.Namespace) -> int:
     restricted = not args.unblock
     action = "BLOCK" if restricted else "UNBLOCK"
 
-    # Block only ever targets video files (video/*). PDFs, slides, MP3s and other
-    # course material are intentionally left downloadable.
+    target = args.target or ("files" if args.unblock else "videos")
+    accept_target, target_label = BLOCK_TARGETS[target]
     try:
-        targets = collect_videos(
-            router.scanner.primary,
+        targets = collect_files_parallel(
+            router.factories,
             args.folder_id,
             recursive=args.recursive,
-            accept=is_video,
+            max_depth=args.max_depth,
+            accept=accept_target,
+            workers=workers,
         )
     except HttpError as exc:
         print(f"[ERR]  scan folders: {exc}{_error_hint(exc)}", file=sys.stderr)
@@ -423,8 +571,8 @@ def run_block(args: argparse.Namespace) -> int:
     if args.max_items is not None:
         targets = targets[: args.max_items]
     print(
-        f"Found {len(targets)} video(s) across {len(args.folder_id)} folder(s). "
-        f"action={action} workers={workers} "
+        f"Found {len(targets)} {target_label} across {len(args.folder_id)} folder(s). "
+        f"target={target} action={action} workers={workers} "
         f"owners={len(router.factories_by_email)} tokens=[{', '.join(router.emails)}] "
         f"skipped_tokens={len(router.skipped_token_errors)} "
         f"dry_run={args.dry_run}"
@@ -443,12 +591,12 @@ def run_block(args: argparse.Namespace) -> int:
             return ItemOutcome("ok", f"[DRY]  {action} {label}")
         service = factory.get()
         try:
-            if get_copy_restriction(service, item.id) == restricted:
+            if copy_restriction_matches(service, item.id, restricted=restricted):
                 return ItemOutcome(
                     "skip", f"[SKIP] {action} {label}: already {action.lower()}ed"
                 )
             applied = set_copy_restriction(service, item.id, restricted=restricted)
-            if applied != restricted:
+            if not applied:
                 return ItemOutcome(
                     "fail",
                     f"[ERR]  {label}: Drive did not apply the {action.lower()} flag",
@@ -492,7 +640,15 @@ def _add_common_scan_args(p: argparse.ArgumentParser) -> None:
     p.add_argument(
         "--max-items",
         type=int,
-        help="Stop after this many videos (useful for daily quota batching).",
+        help="Stop after this many matching files (useful for daily quota batching).",
+    )
+    p.add_argument(
+        "--max-depth",
+        type=int,
+        help=(
+            "Maximum recursive folder depth below each root. "
+            "0 scans only files directly in each root folder."
+        ),
     )
     p.add_argument(
         "--sleep",
@@ -512,13 +668,13 @@ def _add_common_scan_args(p: argparse.ArgumentParser) -> None:
     p.add_argument(
         "--dry-run",
         action="store_true",
-        help="List the videos that would be changed without changing anything.",
+        help="List the matching files that would be changed without changing anything.",
     )
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Transfer video ownership A->B and/or block video download.",
+        description="Transfer video ownership and manage Drive download restrictions.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     sub = parser.add_subparsers(dest="command", required=True)
@@ -563,7 +719,7 @@ def parse_args() -> argparse.Namespace:
 
     b = sub.add_parser(
         "block",
-        help="Block (or --unblock) Download/Copy/Print of videos for viewers & commenters.",
+        help="Block (or --unblock) Download/Copy/Print for matching files.",
     )
     _add_common_scan_args(b)
     b.add_argument(
@@ -571,10 +727,18 @@ def parse_args() -> argparse.Namespace:
         action="append",
         metavar="TOKEN_JSON",
         help=(
-            "OAuth token JSON for an account that OWNS some of the videos. "
+            "OAuth token JSON for an account that OWNS some of the matching files. "
             "Repeat --token for every owner whose files live in the folder; "
             "each file is routed to the matching owner's token automatically "
             "(default: token.json when none given)."
+        ),
+    )
+    b.add_argument(
+        "--target",
+        choices=tuple(BLOCK_TARGETS),
+        help=(
+            "Target videos, all files, or Google Sheets. Defaults to videos for "
+            "block and all files for --unblock."
         ),
     )
     b.add_argument(

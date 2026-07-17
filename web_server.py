@@ -225,6 +225,7 @@ class BlockRequest(BaseModel):
     folders: list[str] = Field(min_length=1)
     recursive: bool = True
     unblock: bool = False
+    target: Literal["videos", "files", "sheets"] | None = None
     dry_run: bool = False
     workers: int = Field(default=4, ge=1, le=16)
 
@@ -708,9 +709,11 @@ def block(request: BlockRequest) -> dict:
                 token_paths.append(account.token_path)
     cmd = [sys.executable, "-u", str(PROTECT_SCRIPT), "block", "--workers", str(request.workers)]
     for token_path in token_paths: cmd += ["--token", token_path]
-    for folder_id in validate_folders(owner, request.folders): cmd += ["--folder-id", folder_id]
+    folder_ids = list(dict.fromkeys(extract_folder_id(value) for value in request.folders))
+    for folder_id in folder_ids: cmd += ["--folder-id", folder_id]
     if request.recursive: cmd.append("--recursive")
     if request.unblock: cmd.append("--unblock")
+    if request.target: cmd += ["--target", request.target]
     if request.dry_run: cmd.append("--dry-run")
     job = start_job("unblock" if request.unblock else "block", [cmd])
     return {"job_id": job.id, "id": job.id, "type": job.kind, "status": job.status}
