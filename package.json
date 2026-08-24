@@ -12,11 +12,12 @@
     "dev:vercel": "npx vercel dev",
     "build": "npm --prefix web run build",
     "typecheck": "npm --prefix web run typecheck",
+    "test": "node --test tests/*.test.mjs",
     "export:vercel-env": "node scripts/export-vercel-env.mjs",
     "print:github-secrets": "node scripts/print-github-secrets.mjs",
     "migrate:kv": "node scripts/migrate-accounts-to-kv.mjs"
   },
   "dependencies": {
-    "googleapis": "^173.0.0"
+    "googleapis": "173.0.0"
   }
 }

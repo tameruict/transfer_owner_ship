@@ -10,18 +10,38 @@ import { Shell } from './components/Shell'
 import { TransferForm } from './components/TransferForm'
 import type { Account, Job, Role, View } from './types'
 
+const JOB_STORAGE_KEY = 'owner-tool-jobs'
+
+function readStoredJobs(): Job[] {
+  if (typeof window === 'undefined') return []
+  try {
+    const raw = window.localStorage.getItem(JOB_STORAGE_KEY)
+    const parsed = raw ? JSON.parse(raw) : []
+    return Array.isArray(parsed) ? parsed.filter(item => item && typeof item.id === 'string') : []
+  } catch {
+    return []
+  }
+}
+
 export default function App() {
   const [view, setView] = useState<View>('transfer')
   const [accounts, setAccounts] = useState<Account[]>([])
   const [connected, setConnected] = useState(false)
   const [loading, setLoading] = useState(false)
-  const [job, setJob] = useState<Job>()
-  const [jobs, setJobs] = useState<Job[]>([])
+  const [jobs, setJobs] = useState<Job[]>(readStoredJobs)
+  const [job, setJob] = useState<Job | undefined>(() => readStoredJobs()[0])
   const [logsOpen, setLogsOpen] = useState(false)
   const [notice, setNotice] = useState('')
   const [userEmail, setUserEmail] = useState('')
   const [authReady, setAuthReady] = useState(false)
   const activeA = useMemo(() => accounts.find(a => a.role === 'A' && a.active) || accounts.find(a => a.role === 'A'), [accounts])
+
+  useEffect(() => {
+    try {
+      if (jobs.length) window.localStorage.setItem(JOB_STORAGE_KEY, JSON.stringify(jobs.slice(0, 50)))
+      else window.localStorage.removeItem(JOB_STORAGE_KEY)
+    } catch { /* storage can be unavailable in private/restricted browsers */ }
+  }, [jobs])
 
   const refreshAccounts = useCallback(async () => { try { setAccounts(await api.accounts()) } catch (error) { setNotice((error as Error).message) } }, [])
   useEffect(() => {
@@ -52,7 +72,15 @@ export default function App() {
     return () => window.clearInterval(timer)
   }, [job?.id, job?.status])
 
-  const startJob = async (kind: 'transfer' | 'block' | 'unblock' | 'copy-drive', payload: unknown) => { setLoading(true); setNotice(''); try { const next = kind === 'transfer' ? await api.startTransfer(payload) : kind === 'copy-drive' ? await api.startCopyDrive(payload) : await api.startBlock(payload); const normalized = { ...next, type: next.type || kind }; setJob(normalized); setJobs(all => [normalized, ...all.filter(item => item.id !== normalized.id)]); setLogsOpen(true) } catch (error) { setNotice((error as Error).message) } finally { setLoading(false) } }
+  const startJob = async (kind: 'transfer' | 'block' | 'unblock' | 'copy-drive', payload: unknown) => {
+    const data = payload && typeof payload === 'object' ? payload as Record<string, unknown> : {}
+    if (data.dry_run === false) {
+      const labels: Record<string, string> = { transfer: 'chuyển ownership', block: 'chặn tải xuống', unblock: 'mở tải xuống', 'copy-drive': 'copy Drive' }
+      const confirmed = window.confirm(`Xác nhận ${labels[kind] || kind} thật? Thay đổi sẽ được ghi trực tiếp vào Google Drive.`)
+      if (!confirmed) return
+    }
+    setLoading(true); setNotice(''); try { const next = kind === 'transfer' ? await api.startTransfer(payload) : kind === 'copy-drive' ? await api.startCopyDrive(payload) : await api.startBlock(payload); const normalized = { ...next, type: next.type || kind }; setJob(normalized); setJobs(all => [normalized, ...all.filter(item => item.id !== normalized.id)]); setLogsOpen(true) } catch (error) { setNotice((error as Error).message) } finally { setLoading(false) }
+  }
   const connectAccount = (role: Role) => {
     setNotice('')
     // Redirect-based Google web OAuth. /api/oauth/start 302s to Google; after

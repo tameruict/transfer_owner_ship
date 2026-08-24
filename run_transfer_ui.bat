@@ -1,3 +1,5 @@
 @echo off
-cd /d "%~dp0\..\.."
-python -m tools.ownership.transfer_ui
+setlocal
+cd /d "%~dp0"
+python transfer_ui.py
+if errorlevel 1 pause

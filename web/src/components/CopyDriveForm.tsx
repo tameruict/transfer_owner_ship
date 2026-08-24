@@ -19,7 +19,7 @@ export function CopyDriveForm({ ownerEmail, busy, onSubmit }: { ownerEmail: stri
   const [workers, setWorkers] = useState('10')
   const [recursive, setRecursive] = useState(true)
   const [checkpoint, setCheckpoint] = useState(true)
-  const [dryRun, setDryRun] = useState(false)
+  const [dryRun, setDryRun] = useState(true)
   const sourceCount = useMemo(() => splitLines(sources).length, [sources])
   const canSubmit = Boolean(ownerEmail && dest.trim() && sourceCount > 0 && !busy)
   const showFileExtensions = filterMode === 'files' || filterMode === 'custom'

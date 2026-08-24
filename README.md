@@ -46,6 +46,20 @@ http://localhost:3000
 - Email: `tamatm6713@gmail.com`
 - Password: mật khẩu anh đã đặt ở bước 2.
 
+### Kiểm tra trước khi push
+
+```powershell
+npm ci
+npm --prefix web ci
+npm test
+npm run typecheck
+npm run build
+python -m compileall -q -f .
+```
+
+Transfer và Copy Drive mặc định bắt đầu ở **Chạy thử**. Khi tắt tùy chọn này,
+web sẽ yêu cầu xác nhận lần nữa trước khi ghi thay đổi vào Google Drive.
+
 ### 4. Deploy lên Vercel
 
 Tạo project:
@@ -153,7 +167,7 @@ Redeploy. Từ giờ bấm chạy trên web → Vercel gửi job sang GitHub Act
 
 | File/thư mục | Vai trò |
 | --- | --- |
-| `api/[...path].js` | Node.js API serverless cho Vercel: auth, accounts, transfer, block. |
+| `api/index.js` | Node.js API serverless cho Vercel: auth, accounts, transfer, block. |
 | `web/` | React/Vite frontend responsive desktop/mobile. |
 | `scripts/export-vercel-env.mjs` | Tạo `.env.local` từ registry token local và mật khẩu anh tự đặt. |
 | `vercel.json` | Cấu hình build/deploy Vercel. |

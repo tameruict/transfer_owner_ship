@@ -8,6 +8,7 @@ const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..')
 const DIST = path.join(ROOT, 'web', 'dist')
 const PORT = Number(process.env.PORT || process.env.OWNER_TOOL_PORT || 3000)
 const HOST = process.env.OWNER_TOOL_HOST || '127.0.0.1'
+const MAX_BODY_BYTES = 2 * 1024 * 1024
 
 function loadEnvLocal() {
   const file = path.join(ROOT, '.env.local')
@@ -42,7 +43,14 @@ function sendJson(res, status, payload) {
 
 async function readBody(req) {
   const chunks = []
-  for await (const chunk of req) chunks.push(chunk)
+  let size = 0
+  for await (const chunk of req) {
+    size += chunk.length
+    if (size > MAX_BODY_BYTES) {
+      throw Object.assign(new Error('Request body quá lớn'), { status: 413 })
+    }
+    chunks.push(chunk)
+  }
   const raw = Buffer.concat(chunks).toString('utf8')
   if (!raw) return undefined
   const type = req.headers['content-type'] || ''
@@ -81,7 +89,9 @@ function serveStatic(req, res, url) {
   const requested = decodeURIComponent(url.pathname === '/' ? '/index.html' : url.pathname)
   const candidate = path.resolve(DIST, `.${requested}`)
   const distRoot = path.resolve(DIST)
-  const file = candidate.startsWith(distRoot) && fs.existsSync(candidate) && fs.statSync(candidate).isFile()
+  const relative = path.relative(distRoot, candidate)
+  const insideDist = relative === '' || (!relative.startsWith('..') && !path.isAbsolute(relative))
+  const file = insideDist && fs.existsSync(candidate) && fs.statSync(candidate).isFile()
     ? candidate
     : path.join(DIST, 'index.html')
   if (!fs.existsSync(file)) {
@@ -103,7 +113,8 @@ const server = http.createServer(async (req, res) => {
     }
     serveStatic(req, res, url)
   } catch (error) {
-    sendJson(res, 500, { message: error.message || 'Local server error' })
+    const status = Number.isInteger(error.status) && error.status >= 400 && error.status < 600 ? error.status : 500
+    sendJson(res, status, { message: error.message || 'Local server error' })
   }
 })
 

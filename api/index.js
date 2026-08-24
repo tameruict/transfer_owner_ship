@@ -5,6 +5,7 @@ import { fileURLToPath } from 'node:url'
 import { google } from 'googleapis'
 import { storeConfigured, readBundle, writeBundle, upsertAccount, removeAccount } from './_store.js'
 import { oauthConfigured, callbackUrl, signState, verifyState, buildAuthUrl, exchangeCode } from './_oauth.js'
+import { mapRunStatus, workflowKindFromRun, cancelOutcome } from './_job.js'
 
 export const config = { api: { bodyParser: true } }
 
@@ -31,6 +32,8 @@ const DISPATCH_MODE = Boolean(GITHUB_REPO && GITHUB_TOKEN)
 
 const jobs = globalThis.__ownerToolJobs || new Map()
 globalThis.__ownerToolJobs = jobs
+const pendingCancels = globalThis.__ownerToolPendingCancels || new Map()
+globalThis.__ownerToolPendingCancels = pendingCancels
 globalThis.__ownerToolActiveA = globalThis.__ownerToolActiveA || ''
 const folderCreateLocks = globalThis.__ownerToolFolderCreateLocks || new Map()
 globalThis.__ownerToolFolderCreateLocks = folderCreateLocks
@@ -868,13 +871,6 @@ async function dispatchJob(kind, payload) {
   }
 }
 
-function mapRunStatus(run) {
-  if (run.status !== 'completed') return run.status === 'in_progress' ? 'running' : 'queued'
-  if (run.conclusion === 'success') return 'completed'
-  if (run.conclusion === 'cancelled') return 'stopped'
-  return 'failed'
-}
-
 async function findRun(jobId) {
   const res = await githubFetch(`/repos/${GITHUB_REPO}/actions/runs?event=workflow_dispatch&per_page=40`)
   if (!res.ok) return null
@@ -952,8 +948,30 @@ async function githubJobStatus(jobId) {
   if (!run) {
     return { id: jobId, job_id: jobId, status: 'queued', runner: 'github', progress: 5, logs: ['Đang chờ GitHub Actions nhận job…'] }
   }
+  const cancelRequestedAt = pendingCancels.get(jobId)
+  if (cancelRequestedAt) {
+    if (Date.now() - cancelRequestedAt > 10 * 60 * 1000) {
+      pendingCancels.delete(jobId)
+    } else if (run.status !== 'completed') {
+      const response = await githubFetch(`/repos/${GITHUB_REPO}/actions/runs/${run.id}/cancel`, { method: 'POST' })
+      if (response.ok) {
+        pendingCancels.delete(jobId)
+        return {
+          id: jobId,
+          job_id: jobId,
+          status: 'stopped',
+          runner: 'github',
+          run_id: run.id,
+          run_url: run.html_url,
+          logs: ['Đã yêu cầu dừng job trên GitHub Actions.'],
+        }
+      }
+    } else {
+      pendingCancels.delete(jobId)
+    }
+  }
   const status = mapRunStatus(run)
-  const kindMatch = String(run.name || '').match(/owner-tool\s+(\w+)/)
+  const kind = workflowKindFromRun(run)
   const progress = status === 'completed' ? 100 : status === 'running' ? 50 : status === 'queued' ? 10 : 100
   // Force a fresh log pull once the run is done so the final poll (after which
   // the frontend stops polling) always carries the complete [OK]/[ERR] output.
@@ -970,7 +988,7 @@ async function githubJobStatus(jobId) {
   return {
     id: jobId,
     job_id: jobId,
-    type: kindMatch ? kindMatch[1] : undefined,
+    type: kind,
     status,
     runner: 'github',
     run_id: run.id,
@@ -986,17 +1004,22 @@ async function githubJobStatus(jobId) {
 
 async function githubCancel(jobId) {
   const run = await findRun(jobId)
-  if (!run) return { id: jobId, job_id: jobId, status: 'queued', runner: 'github' }
+  if (!run) {
+    pendingCancels.set(jobId, Date.now())
+    return { id: jobId, job_id: jobId, status: 'queued', runner: 'github', logs: ['GitHub chưa nhận diện run; yêu cầu dừng sẽ được áp dụng khi run xuất hiện.'] }
+  }
+  const base = { id: jobId, job_id: jobId, runner: 'github', run_id: run.id, run_url: run.html_url }
+  if (run.status === 'completed') {
+    return { ...base, status: mapRunStatus(run), logs: ['Run đã kết thúc trước khi nhận yêu cầu dừng.'] }
+  }
   if (run.status !== 'completed') {
-    await githubFetch(`/repos/${GITHUB_REPO}/actions/runs/${run.id}/cancel`, { method: 'POST' }).catch(() => {})
+    const response = await githubFetch(`/repos/${GITHUB_REPO}/actions/runs/${run.id}/cancel`, { method: 'POST' })
+    const outcome = cancelOutcome(run, response)
+    if (!outcome) throw Object.assign(new Error(`GitHub từ chối dừng run (${response.status})`), { status: 502 })
   }
   return {
-    id: jobId,
-    job_id: jobId,
+    ...base,
     status: 'stopped',
-    runner: 'github',
-    run_id: run.id,
-    run_url: run.html_url,
     logs: ['Đã yêu cầu dừng job trên GitHub Actions.'],
   }
 }
@@ -1356,7 +1379,12 @@ export default async function handler(req, res) {
       if (DISPATCH_MODE) return json(res, 200, await githubCancel(parts[1]))
       const job = jobs.get(parts[1])
       if (!job) return json(res, 404, { message: 'Job not found' })
-      return json(res, 200, { ...job, status: job.status === 'running' ? 'stopped' : job.status })
+      if (job.status === 'running' || job.status === 'queued') {
+        const stopped = { ...job, status: 'stopped', finished_at: new Date().toISOString() }
+        jobs.set(parts[1], stopped)
+        return json(res, 200, stopped)
+      }
+      return json(res, 200, job)
     }
 
     if (parts[0] === 'jobs' && parts[1] && req.method === 'GET') {

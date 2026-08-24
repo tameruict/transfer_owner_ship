@@ -17,6 +17,9 @@ on:
         required: true
         type: string
 
+permissions:
+  contents: read
+
 # Chạy tuần tự để không đụng quota Drive. Bỏ block này nếu muốn chạy song song.
 concurrency:
   group: owner-tool-drive

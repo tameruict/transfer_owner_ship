@@ -13,7 +13,7 @@ export function TransferForm({ accounts, ownerEmail, busy, onSubmit }: { account
   const [noNotify, setNoNotify] = useState(false)
   const [verify, setVerify] = useState(false)
   const [workers, setWorkers] = useState('4')
-  const [dryRun, setDryRun] = useState(false)
+  const [dryRun, setDryRun] = useState(true)
   const receivers = useMemo(() => accounts.filter(a => a.role === 'B'), [accounts])
   const update = (id: string, patch: Partial<TransferRow>) => setRows(value => value.map(row => row.id === id ? { ...row, ...patch } : row))
   const submit = () => onSubmit({ owner_email: ownerEmail, rows: rows.map(row => ({ folders: row.folders.split(/\r?\n|,/).map(v => v.trim()).filter(Boolean), receiver_email: row.receiver_email })), mode, scope, recursive, no_notify: noNotify, verify, workers: Number(workers), dry_run: dryRun })
